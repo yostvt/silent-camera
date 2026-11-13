@@ -23,7 +23,20 @@
     font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif;
     -webkit-user-select: none; user-select: none; touch-action: manipulation;
   }
-  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; touch-action: none; }
+  #grid { position: fixed; pointer-events: none; display: none; }
+  #grid i { position: absolute; background: rgba(255,255,255,.45); box-shadow: 0 0 1px rgba(0,0,0,.5); }
+  #grid i.v { top: 0; bottom: 0; width: 1px; }
+  #grid i.h { left: 0; right: 0; height: 1px; }
+  #ev {
+    position: fixed; right: 16px; top: 50%; transform: translateY(-50%); display: flex; flex-direction: column;
+    align-items: center; gap: 8px; opacity: 0; transition: opacity .4s; pointer-events: none;
+  }
+  #ev.on { opacity: 1; transition: none; }
+  #evBar { width: 4px; height: 160px; border-radius: 2px; background: rgba(255,255,255,.3); position: relative; }
+  #evKnob { position: absolute; left: 50%; width: 22px; height: 22px; margin: -11px 0 0 -11px; border-radius: 50%;
+    background: var(--accent); display: flex; align-items: center; justify-content: center; font-size: 13px; color: #000; }
+  #evVal { font-size: 13px; font-weight: 700; color: var(--accent); text-shadow: 0 0 3px #000; }
   video { width: 100%; height: 100%; object-fit: contain; background: #000; }
   video.mirror { transform: scaleX(-1); }
   #flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none; transition: opacity .25s; }
@@ -125,6 +138,8 @@
 </head>
 <body>
 <div id="stage"><video id="video" playsinline muted autoplay></video></div>
+<div id="grid"><i class="v" style="left:33.333%"></i><i class="v" style="left:66.667%"></i><i class="h" style="top:33.333%"></i><i class="h" style="top:66.667%"></i></div>
+<div id="ev"><span id="evVal">±0</span><div id="evBar"><div id="evKnob">☀</div></div></div>
 <div id="flash"></div>
 
 <div class="top">
@@ -175,6 +190,7 @@
   <b>使い方</b><br>
   ・保存ボタン →「画像を保存」で写真アプリに入ります<br>
   ・<b>高画質 夜モード</b>：暗い場所向け。数枚を重ねてザラつきを減らします。撮影中（約0.5秒）はスマホを動かさないでください<br>
+  ・<b>明るさ</b>：画面を上になぞると明るく、下になぞると暗くなります。ダブルタップで元に戻ります<br>
   ・シャッター上のボタンで使うカメラを選べます（超広角・望遠は対応機種のみ。「自動」はiPhoneが距離に合わせてレンズを切り替えます）<br>
   ・撮った写真はアプリ内に自動で保存され、閉じても消えません。写真アプリへは一覧の「保存」ボタンから入れてください<br>
   ・Safariの共有ボタン→「ホーム画面に追加」から使うのがおすすめです（Safariのままだと7日間使わないと写真が消えることがあります）
@@ -193,6 +209,8 @@
     devIndex: 0,
     facing: 'environment',
     nr: false,
+    ev: 0,              // brightness, -2..+2
+    hwEv: null,         // {min,max} if camera supports exposureCompensation
     busy: false,
     photos: [],         // {id, blob, url, w, h, name, saved, ts}  (oldest first)
     sel: -1,
@@ -311,7 +329,93 @@
 
     video.classList.toggle('mirror', isFront());
     await waitForSize();
+    detectHwEv();
+    applyEv();
+    layoutGrid();
     updateBadges();
+  }
+
+  // ---------- grid ----------
+  function layoutGrid() {
+    const g = $('grid'), vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw) { g.style.display = 'none'; return; }
+    const W = window.innerWidth, H = window.innerHeight;
+    const k = Math.min(W / vw, H / vh), w = vw * k, h = vh * k;
+    Object.assign(g.style, { display: 'block', width: w + 'px', height: h + 'px', left: (W - w) / 2 + 'px', top: (H - h) / 2 + 'px' });
+  }
+  window.addEventListener('resize', layoutGrid);
+  video.addEventListener('resize', layoutGrid);
+
+  // ---------- brightness ----------
+  const EV_MIN = -2, EV_MAX = 2;
+  function detectHwEv() {
+    state.hwEv = null;
+    try {
+      const tr = state.stream.getVideoTracks()[0];
+      const c = tr.getCapabilities ? tr.getCapabilities() : null;
+      if (c && c.exposureCompensation && c.exposureCompensation.max > c.exposureCompensation.min) {
+        state.hwEv = { min: c.exposureCompensation.min, max: c.exposureCompensation.max };
+      }
+    } catch (_) {}
+  }
+  const swFactor = () => Math.pow(2, state.ev * 0.5); // software: ×0.5 .. ×2
+  let evPending = false;
+  function applyEv() {
+    if (state.hwEv) {
+      video.style.filter = '';
+      if (evPending) return;
+      evPending = true;
+      requestAnimationFrame(async () => {
+        evPending = false;
+        const v = Math.max(state.hwEv.min, Math.min(state.hwEv.max, state.ev));
+        try { await state.stream.getVideoTracks()[0].applyConstraints({ advanced: [{ exposureCompensation: v }] }); }
+        catch (_) { state.hwEv = null; applyEv(); }
+      });
+    } else {
+      video.style.filter = state.ev ? `brightness(${swFactor()})` : '';
+    }
+  }
+  let evHide;
+  function showEv() {
+    const e = $('ev'); e.classList.add('on');
+    const t = (state.ev - EV_MIN) / (EV_MAX - EV_MIN);
+    $('evKnob').style.top = (1 - t) * 100 + '%';
+    const v = Math.round(state.ev * 10) / 10;
+    $('evVal').textContent = v === 0 ? '±0' : (v > 0 ? '+' : '') + v.toFixed(1);
+    clearTimeout(evHide); evHide = setTimeout(() => e.classList.remove('on'), 1200);
+  }
+  function setEv(v) {
+    v = Math.max(EV_MIN, Math.min(EV_MAX, v));
+    if (Math.abs(v) < 0.08) v = 0; // snap to 0
+    state.ev = v; applyEv(); showEv();
+  }
+  (() => {
+    const st = $('stage');
+    let startY = null, startEv = 0, lastTap = 0;
+    st.addEventListener('pointerdown', (e) => {
+      startY = e.clientY; startEv = state.ev;
+      const now = Date.now();
+      if (now - lastTap < 300) { setEv(0); startY = null; }
+      lastTap = now;
+    });
+    st.addEventListener('pointermove', (e) => {
+      if (startY == null) return;
+      const dy = startY - e.clientY;
+      if (Math.abs(dy) < 6 && state.ev === startEv) return;
+      setEv(startEv + dy / (window.innerHeight * 0.5) * (EV_MAX - EV_MIN));
+    });
+    const end = () => { startY = null; };
+    st.addEventListener('pointerup', end);
+    st.addEventListener('pointercancel', end);
+  })();
+
+  // Software brightness for the saved photo (same curve as the preview filter)
+  function applySwEv(imgData) {
+    if (state.hwEv || !state.ev) return;
+    const f = swFactor(), lut = new Uint8ClampedArray(256);
+    for (let i = 0; i < 256; i++) lut[i] = i * f;
+    const d = imgData.data;
+    for (let i = 0; i < d.length; i += 4) { d[i] = lut[d[i]]; d[i + 1] = lut[d[i + 1]]; d[i + 2] = lut[d[i + 2]]; }
   }
 
   function waitForSize() {
@@ -450,6 +554,11 @@
       if (!state.nr) {
         drawFrame(w, h, mirror);
         flash();
+        if (!state.hwEv && state.ev) {
+          const im = ctx.getImageData(0, 0, w, h);
+          applySwEv(im);
+          ctx.putImageData(im, 0, 0);
+        }
       } else {
         // Multi-frame averaging: reduces sensor noise in dim light (subject & phone must stay still).
         const N = 6;
@@ -468,6 +577,7 @@
         for (let i = 0, j = 0; i < o.length; i += 4, j += 3) {
           o[i] = acc[j] / N; o[i + 1] = acc[j + 1] / N; o[i + 2] = acc[j + 2] / N; o[i + 3] = 255;
         }
+        applySwEv(out);
         ctx.putImageData(out, 0, 0);
       }
       const blob = await new Promise((res) => canvas.toBlob(res, 'image/jpeg', 0.95));
