@@ -67,8 +67,16 @@
     justify-self: end; display: flex; align-items: center; justify-content: center;
   }
   #switch svg { width: 28px; height: 28px; }
-  #lensLabel { position: fixed; left: 0; right: 0; text-align: center; bottom: calc(var(--safe-bottom) + 128px); pointer-events: none; }
-  #lensLabel span { font-size: 12px; background: rgba(0,0,0,.5); padding: 4px 10px; border-radius: 999px; }
+  #lenses {
+    position: fixed; left: 0; right: 0; bottom: calc(var(--safe-bottom) + 126px);
+    display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; padding: 0 12px;
+  }
+  #lenses button {
+    font-size: 13px; padding: 7px 13px; border-radius: 999px; border: 1px solid rgba(255,255,255,.3);
+    background: rgba(0,0,0,.55); color: #fff;
+  }
+  #lenses button.on { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 700; }
+  #lenses button:disabled { opacity: .5; }
 
   /* Start / error screen */
   #start {
@@ -125,7 +133,7 @@
   <button class="chip" id="help">?</button>
 </div>
 
-<div id="lensLabel"><span id="lensName"></span></div>
+<div id="lenses"></div>
 
 <div class="bottom">
   <button id="thumb" aria-label="撮った写真"></button>
@@ -167,7 +175,7 @@
   <b>使い方</b><br>
   ・保存ボタン →「画像を保存」で写真アプリに入ります<br>
   ・<b>高画質 夜モード</b>：暗い場所向け。数枚を重ねてザラつきを減らします。撮影中（約0.5秒）はスマホを動かさないでください<br>
-  ・カメラ切替ボタンで前面／背面（端末によっては超広角・望遠）を順に切り替えます<br>
+  ・シャッター上のボタンで使うカメラを選べます（超広角・望遠は対応機種のみ。「自動」はiPhoneが距離に合わせてレンズを切り替えます）<br>
   ・撮った写真はアプリ内に自動で保存され、閉じても消えません。写真アプリへは一覧の「保存」ボタンから入れてください<br>
   ・Safariの共有ボタン→「ホーム画面に追加」から使うのがおすすめです（Safariのままだと7日間使わないと写真が消えることがあります）
   <button class="bigbtn" id="tipClose">OK</button>
@@ -319,7 +327,62 @@
     const mp = (w * h / 1e6);
     $('res').textContent = w ? `${w}×${h}（${mp.toFixed(1)}MP）` : '--';
     const tr = state.stream && state.stream.getVideoTracks()[0];
-    $('lensName').textContent = tr ? (tr.label || (isFront() ? '前面カメラ' : '背面カメラ')) : '';
+    renderLenses();
+  }
+
+  // Short Japanese names for iOS camera labels (works for Japanese & English labels)
+  function lensInfo(label, idx) {
+    const l = (label || '').toLowerCase();
+    const front = /前面|front|user|facetime/.test(l);
+    if (front) return { name: '前面', order: 90 };
+    if (/トリプル|triple/.test(l)) return { name: '自動（3眼）', order: 50 };
+    if (/デュアル広角|dual wide/.test(l)) return { name: '自動（広角＋超広角）', order: 51 };
+    if (/デュアル|dual/.test(l)) return { name: '自動（広角＋望遠）', order: 52 };
+    if (/超広角|ultra ?wide/.test(l)) return { name: '超広角 0.5×', order: 10 };
+    if (/望遠|tele/.test(l)) return { name: '望遠', order: 30 };
+    if (/背面|back|rear|environment/.test(l)) return { name: '広角 1×', order: 20 };
+    return { name: label || `カメラ${idx + 1}`, order: 70 };
+  }
+
+  function currentDeviceId() {
+    const tr = state.stream && state.stream.getVideoTracks()[0];
+    return tr && tr.getSettings ? tr.getSettings().deviceId : null;
+  }
+
+  function renderLenses() {
+    const box = $('lenses');
+    box.innerHTML = '';
+    if (state.devices.length < 2) { $('switch').style.visibility = state.devices.length ? 'hidden' : ''; return; }
+    $('switch').style.visibility = 'hidden';
+    const cur = currentDeviceId();
+    const items = state.devices.map((d, i) => ({ d, i, ...lensInfo(d.label, i) }))
+      .sort((a, b) => a.order - b.order || a.i - b.i);
+    for (const it of items) {
+      const b = document.createElement('button');
+      b.textContent = it.name;
+      if (it.d.deviceId === cur) b.className = 'on';
+      b.onclick = () => selectCamera(it.i);
+      box.appendChild(b);
+    }
+  }
+
+  async function selectCamera(i) {
+    const d = state.devices[i];
+    if (!d || state.busy || d.deviceId === currentDeviceId()) return;
+    state.busy = true;
+    [...$('lenses').children].forEach((b) => (b.disabled = true));
+    try {
+      await openCamera(d.deviceId);
+      state.devIndex = i;
+      try { localStorage.setItem('sc_cam', d.deviceId); } catch (_) {}
+    } catch (e) {
+      toast('このカメラは使えませんでした');
+      const prev = state.devices[state.devIndex];
+      try { await openCamera(prev && prev.deviceId); } catch (_) {}
+    } finally {
+      state.busy = false;
+      renderLenses();
+    }
   }
 
   async function listDevices() {
@@ -329,6 +392,14 @@
     const curId = cur && cur.getSettings ? cur.getSettings().deviceId : null;
     const i = state.devices.findIndex((d) => d.deviceId === curId);
     state.devIndex = i >= 0 ? i : 0;
+    // Restore the camera used last time
+    let saved = null;
+    try { saved = localStorage.getItem('sc_cam'); } catch (_) {}
+    const si = saved ? state.devices.findIndex((d) => d.deviceId === saved) : -1;
+    if (si >= 0 && si !== state.devIndex) {
+      try { await openCamera(saved); state.devIndex = si; } catch (_) {}
+    }
+    renderLenses();
   }
 
   async function switchCamera() {
