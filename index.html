@@ -97,6 +97,11 @@
   .gactions { display: flex; gap: 10px; padding: 10px 14px 14px; }
   .gactions button { flex: 1; font-size: 15px; padding: 13px; border-radius: 12px; border: none; background: #2a2a2a; color: #fff; }
   .gactions button.primary { background: var(--accent); color: #000; font-weight: 600; }
+  #strip .w { position: relative; flex: none; }
+  #strip .w.done::after { content: "✓"; position: absolute; right: 2px; bottom: 2px; width: 18px; height: 18px; border-radius: 50%;
+    background: #34c759; color: #fff; font-size: 12px; line-height: 18px; text-align: center; font-weight: 700; }
+  .gtools { display: flex; justify-content: space-between; align-items: center; padding: 0 14px; font-size: 12px; color: #999; gap: 8px; }
+  .gtools button { font-size: 12px; background: none; border: 1px solid #444; color: #ccc; border-radius: 999px; padding: 5px 10px; }
   #info { text-align: center; font-size: 12px; color: #999; padding: 2px 0 4px; }
 
   #toast {
@@ -148,8 +153,12 @@
   <div id="viewer"><img id="gImg" alt=""></div>
   <div id="info"></div>
   <div id="strip"></div>
+  <div class="gtools">
+    <span id="usage"></span>
+    <button id="gCleanup">写真アプリに保存済みを削除</button>
+  </div>
   <div class="gactions">
-    <button id="gSaveAll">すべて保存</button>
+    <button id="gSaveAll">未保存をまとめて保存</button>
     <button class="primary" id="gSave">この写真を保存</button>
   </div>
 </div>
@@ -159,8 +168,8 @@
   ・保存ボタン →「画像を保存」で写真アプリに入ります<br>
   ・<b>高画質 夜モード</b>：暗い場所向け。数枚を重ねてザラつきを減らします。撮影中（約0.5秒）はスマホを動かさないでください<br>
   ・カメラ切替ボタンで前面／背面（端末によっては超広角・望遠）を順に切り替えます<br>
-  ・撮った写真はこの画面を閉じると消えます。必要なものは保存してください<br>
-  ・Safariの共有ボタン→「ホーム画面に追加」でアプリのように使えます
+  ・撮った写真はアプリ内に自動で保存され、閉じても消えません。写真アプリへは一覧の「保存」ボタンから入れてください<br>
+  ・Safariの共有ボタン→「ホーム画面に追加」から使うのがおすすめです（Safariのままだと7日間使わないと写真が消えることがあります）
   <button class="bigbtn" id="tipClose">OK</button>
 </div></div>
 
@@ -177,7 +186,7 @@
     facing: 'environment',
     nr: false,
     busy: false,
-    photos: [],         // {blob, url, w, h, name}
+    photos: [],         // {id, blob, url, w, h, name, saved, ts}  (oldest first)
     sel: -1,
   };
 
@@ -197,6 +206,56 @@
   function stamp() {
     const d = new Date(), p = (n) => String(n).padStart(2, '0');
     return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  }
+
+  // ---------- storage (IndexedDB) ----------
+  const DB_NAME = 'silent-camera', STORE = 'photos';
+  let dbp = null;
+  function db() {
+    if (!dbp) dbp = new Promise((res, rej) => {
+      const r = indexedDB.open(DB_NAME, 1);
+      r.onupgradeneeded = () => r.result.createObjectStore(STORE, { keyPath: 'id' });
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+    return dbp;
+  }
+  async function tx(mode, fn) {
+    const d = await db();
+    return new Promise((res, rej) => {
+      const t = d.transaction(STORE, mode);
+      const out = fn(t.objectStore(STORE));
+      t.oncomplete = () => res(out && out.result !== undefined ? out.result : undefined);
+      t.onerror = () => rej(t.error);
+      t.onabort = () => rej(t.error);
+    });
+  }
+  const dbPut = (rec) => tx('readwrite', (s) => s.put(rec));
+  const dbDel = (id) => tx('readwrite', (s) => s.delete(id));
+  const dbAll = () => tx('readonly', (s) => s.getAll());
+  const toRec = (p) => ({ id: p.id, blob: p.blob, w: p.w, h: p.h, name: p.name, saved: p.saved, ts: p.ts });
+
+  async function loadPhotos() {
+    try {
+      const recs = (await dbAll()) || [];
+      recs.sort((a, b) => a.ts - b.ts);
+      state.photos = recs.map((r) => ({ ...r, url: URL.createObjectURL(r.blob) }));
+    } catch (e) { toast('保存領域を開けませんでした'); }
+    renderThumb();
+    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (_) {}
+  }
+
+  async function updateUsage() {
+    const total = state.photos.length, unsaved = state.photos.filter((p) => !p.saved).length;
+    let txt = `${total}枚（未保存 ${unsaved}）`;
+    try {
+      if (navigator.storage && navigator.storage.estimate) {
+        const e = await navigator.storage.estimate();
+        const gb = (n) => n >= 1e9 ? (n / 1e9).toFixed(1) + 'GB' : Math.round(n / 1e6) + 'MB';
+        txt += `・使用 ${gb(e.usage || 0)}` + (e.quota ? ` / 上限 約${gb(e.quota)}` : '');
+      }
+    } catch (_) {}
+    $('usage').textContent = txt;
   }
 
   // ---------- camera ----------
@@ -356,17 +415,22 @@
     requestAnimationFrame(() => requestAnimationFrame(() => f.classList.remove('on')));
   }
 
-  function addPhoto(blob, w, h) {
-    const url = URL.createObjectURL(blob);
-    state.photos.push({ blob, url, w, h, name: `IMG_${stamp()}_${state.photos.length + 1}.jpg` });
+  async function addPhoto(blob, w, h) {
+    const ts = Date.now();
+    const p = { id: ts + '-' + Math.random().toString(36).slice(2, 7), blob, w, h,
+      name: `IMG_${stamp()}_${String(ts).slice(-3)}.jpg`, saved: false, ts, url: URL.createObjectURL(blob) };
+    state.photos.push(p);
     renderThumb();
+    try { await dbPut(toRec(p)); }
+    catch (e) { toast('アプリ内に保存できませんでした（容量不足の可能性）'); }
   }
 
   function renderThumb() {
     const t = $('thumb');
     const last = state.photos[state.photos.length - 1];
     t.style.backgroundImage = last ? `url(${last.url})` : '';
-    t.innerHTML = state.photos.length ? `<span id="count">${state.photos.length}</span>` : '';
+    const unsaved = state.photos.filter((p) => !p.saved).length;
+    t.innerHTML = unsaved ? `<span id="count">${unsaved}</span>` : '';
   }
 
   // ---------- gallery ----------
@@ -382,23 +446,46 @@
     const p = state.photos[state.sel];
     $('gImg').src = p.url;
     $('gTitle').textContent = `${state.sel + 1} / ${state.photos.length}`;
-    $('info').textContent = `${p.w}×${p.h}・${(p.blob.size / 1024 / 1024).toFixed(1)}MB`;
+    const d = new Date(p.ts), z = (n) => String(n).padStart(2, '0');
+    $('info').textContent = `${d.getMonth() + 1}/${d.getDate()} ${z(d.getHours())}:${z(d.getMinutes())}・${p.w}×${p.h}・${(p.blob.size / 1024 / 1024).toFixed(1)}MB・` + (p.saved ? '写真アプリに保存済み ✓' : '未保存');
     const strip = $('strip');
     strip.innerHTML = '';
     state.photos.forEach((ph, k) => {
+      const w = document.createElement('div');
+      w.className = 'w' + (ph.saved ? ' done' : '');
       const im = document.createElement('img');
-      im.src = ph.url; if (k === state.sel) im.className = 'sel';
+      im.src = ph.url; im.loading = 'lazy'; if (k === state.sel) im.className = 'sel';
       im.onclick = () => renderGallery(k);
-      strip.appendChild(im);
+      w.appendChild(im); strip.appendChild(w);
     });
-    $('gSaveAll').style.display = state.photos.length > 1 ? '' : 'none';
+    const sel = strip.children[state.sel];
+    if (sel && sel.scrollIntoView) sel.scrollIntoView({ block: 'nearest', inline: 'center' });
+    const unsaved = state.photos.filter((x) => !x.saved).length;
+    $('gSaveAll').textContent = `未保存をまとめて保存（${Math.min(unsaved, SHARE_MAX)}枚）`;
+    $('gSaveAll').disabled = !unsaved;
+    $('gSaveAll').style.opacity = unsaved ? 1 : .4;
+    $('gSave').textContent = p.saved ? 'もう一度保存' : 'この写真を保存';
+    updateUsage();
   }
 
+  const SHARE_MAX = 20; // iOS share sheet gets slow with many large files
+  async function markSaved(list) {
+    for (const p of list) {
+      p.saved = true;
+      try { await dbPut(toRec(p)); } catch (_) {}
+    }
+    renderThumb();
+    if ($('gallery').classList.contains('open')) renderGallery(state.sel);
+  }
   async function savePhotos(list) {
+    if (!list.length) return;
     const files = list.map((p) => new File([p.blob], p.name, { type: 'image/jpeg' }));
     if (navigator.canShare && navigator.canShare({ files })) {
       try {
         await navigator.share({ files });
+        await markSaved(list);
+        const left = state.photos.filter((p) => !p.saved).length;
+        toast(left ? `保存しました（未保存があと${left}枚）` : '保存しました');
         return;
       } catch (e) {
         if (e && e.name === 'AbortError') return;
@@ -410,17 +497,33 @@
       a.href = p.url; a.download = p.name;
       document.body.appendChild(a); a.click(); a.remove();
     }
-    toast('ダウンロードしました（長押しで保存も可）');
+    await markSaved(list);
+    toast('ダウンロードしました');
   }
 
+  async function removePhotos(list) {
+    for (const p of list) {
+      try { await dbDel(p.id); } catch (_) {}
+      URL.revokeObjectURL(p.url);
+    }
+    const ids = new Set(list.map((p) => p.id));
+    state.photos = state.photos.filter((p) => !ids.has(p.id));
+    renderThumb();
+    if (!state.photos.length) closeGallery();
+    else renderGallery(Math.min(state.sel, state.photos.length - 1));
+  }
   function deleteCurrent() {
     const p = state.photos[state.sel];
     if (!p) return;
-    URL.revokeObjectURL(p.url);
-    state.photos.splice(state.sel, 1);
-    renderThumb();
-    if (!state.photos.length) closeGallery();
-    else renderGallery(state.sel);
+    const msg = p.saved ? 'この写真をアプリから削除します（写真アプリの方は残ります）。' : 'この写真はまだ写真アプリに保存していません。削除すると元に戻せません。削除しますか？';
+    if (!confirm(msg)) return;
+    removePhotos([p]);
+  }
+  function cleanupSaved() {
+    const list = state.photos.filter((p) => p.saved);
+    if (!list.length) { toast('保存済みの写真はありません'); return; }
+    if (!confirm(`写真アプリに保存済みの${list.length}枚をアプリから削除します（写真アプリの方は残ります）。よろしいですか？`)) return;
+    removePhotos(list).then(() => toast(`${list.length}枚を削除しました`));
   }
 
   // ---------- start ----------
@@ -433,6 +536,7 @@
     try {
       await openCamera();
       await listDevices();
+      await loadPhotos();
       $('start').style.display = 'none';
       try { if (!localStorage.getItem('sc_tip')) { $('tip').classList.add('open'); localStorage.setItem('sc_tip', '1'); } } catch (_) {}
     } catch (e) {
@@ -460,7 +564,8 @@
   $('thumb').onclick = () => openGallery();
   $('gClose').onclick = closeGallery;
   $('gSave').onclick = () => savePhotos([state.photos[state.sel]]);
-  $('gSaveAll').onclick = () => savePhotos(state.photos.slice());
+  $('gSaveAll').onclick = () => savePhotos(state.photos.filter((p) => !p.saved).slice(0, SHARE_MAX));
+  $('gCleanup').onclick = cleanupSaved;
   $('gDel').onclick = deleteCurrent;
   $('nr').onclick = () => {
     state.nr = !state.nr;
