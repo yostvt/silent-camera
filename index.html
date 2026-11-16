@@ -28,6 +28,22 @@
   #grid i { position: absolute; background: rgba(255,255,255,.45); box-shadow: 0 0 1px rgba(0,0,0,.5); }
   #grid i.v { top: 0; bottom: 0; width: 1px; }
   #grid i.h { left: 0; right: 0; height: 1px; }
+  #level { position: fixed; width: 0; height: 0; pointer-events: none; display: none; }
+  #level .rot { position: absolute; left: 0; top: 0; width: 0; height: 0; }
+  #level i { position: absolute; height: 2px; top: -1px; background: #fff; box-shadow: 0 0 2px rgba(0,0,0,.6); border-radius: 1px; }
+  #level .sl { left: -110px; width: 44px; }
+  #level .sr { left: 66px; width: 44px; }
+  #level .c { left: -56px; width: 112px; }
+  #level.ok i { background: var(--accent); }
+  #level.ok .c { left: -110px; width: 220px; }
+  #level.ok .sl, #level.ok .sr { opacity: 0; }
+  #cross { position: fixed; width: 0; height: 0; pointer-events: none; display: none; }
+  #cross b { position: absolute; left: 0; top: 0; width: 0; height: 0; }
+  #cross b::before, #cross b::after { content: ""; position: absolute; background: #fff; box-shadow: 0 0 2px rgba(0,0,0,.6); }
+  #cross b::before { left: -14px; top: -1px; width: 28px; height: 2px; }
+  #cross b::after { left: -1px; top: -14px; width: 2px; height: 28px; }
+  #cross b.y::before, #cross b.y::after { background: var(--accent); }
+  #cross.ok b::before, #cross.ok b::after { background: var(--accent); }
   #ev {
     position: fixed; right: 16px; top: 50%; transform: translateY(-50%); display: flex; flex-direction: column;
     align-items: center; gap: 8px; opacity: 0; transition: opacity .4s; pointer-events: none;
@@ -139,6 +155,8 @@
 <body>
 <div id="stage"><video id="video" playsinline muted autoplay></video></div>
 <div id="grid"><i class="v" style="left:33.333%"></i><i class="v" style="left:66.667%"></i><i class="h" style="top:33.333%"></i><i class="h" style="top:66.667%"></i></div>
+<div id="level"><div class="rot" id="lvTarget"><i class="sl"></i><i class="sr"></i></div><div class="rot" id="lvCenter"><i class="c"></i></div></div>
+<div id="cross"><b id="crossFix"></b><b class="y" id="crossMove"></b></div>
 <div id="ev"><span id="evVal">±0</span><div id="evBar"><div id="evKnob">☀</div></div></div>
 <div id="flash"></div>
 
@@ -190,6 +208,7 @@
   <b>使い方</b><br>
   ・保存ボタン →「画像を保存」で写真アプリに入ります<br>
   ・<b>高画質 夜モード</b>：暗い場所向け。数枚を重ねてザラつきを減らします。撮影中（約0.5秒）はスマホを動かさないでください<br>
+  ・<b>水平器</b>：少し傾くと中央に線が出て、水平になると黄色の1本になります。真下に向けると＋マークが出て、2つが重なると真下です<br>
   ・<b>明るさ</b>：画面を上になぞると明るく、下になぞると暗くなります。ダブルタップで元に戻ります<br>
   ・シャッター上のボタンで使うカメラを選べます（超広角・望遠は対応機種のみ。「自動」はiPhoneが距離に合わせてレンズを切り替えます）<br>
   ・撮った写真はアプリ内に自動で保存され、閉じても消えません。写真アプリへは一覧の「保存」ボタンから入れてください<br>
@@ -345,7 +364,77 @@
     const k = Math.min(W / vw, H / vh), w = vw * k, h = vh * k;
     Object.assign(g.style, { display: 'block', width: w + 'px', height: h + 'px', left: (W - w) / 2 + 'px', top: (H - h) / 2 + 'px' });
     updateVideoTransform(W, H, w, h);
+    placeLevel();
   }
+
+  // ---------- level (horizon / top-down) ----------
+  const lv = { u: null, center: [0, 0], okSince: 0 };
+  function placeLevel() {
+    const g = $('grid');
+    const W = window.innerWidth, H = window.innerHeight;
+    let cx = W / 2, cy = H / 2;
+    if (g.style.display === 'block') {
+      cx = parseFloat(g.style.left) + parseFloat(g.style.width) / 2;
+      cy = parseFloat(g.style.top) + parseFloat(g.style.height) / 2;
+    }
+    for (const id of ['level', 'cross']) Object.assign($(id).style, { left: cx + 'px', top: cy + 'px' });
+  }
+  const screenAngle = () => (typeof window.orientation === 'number' ? window.orientation
+    : (screen.orientation && screen.orientation.angle) || 0);
+  const DEG = Math.PI / 180;
+  function onOrient(e) {
+    if (e.beta == null || e.gamma == null) return;
+    const b = e.beta * DEG, g = e.gamma * DEG;
+    // "up" direction in device coordinates (x: right, y: top of screen, z: out of screen)
+    const raw = [-Math.sin(g) * Math.cos(b), Math.sin(b), Math.cos(g) * Math.cos(b)];
+    if (!lv.u) lv.u = raw;
+    else for (let i = 0; i < 3; i++) lv.u[i] += (raw[i] - lv.u[i]) * 0.3; // smoothing
+    drawLevel();
+  }
+  function drawLevel() {
+    const [ux, uy, uz] = lv.u, L = $('level'), C = $('cross');
+    const inPlane = Math.hypot(ux, uy);
+    const orient = screenAngle();
+    if ($('start').style.display !== 'none') { L.style.display = C.style.display = 'none'; return; }
+
+    // Top-down: camera pointing at the ground (screen facing up), within ~10°
+    if (uz > Math.cos(10 * DEG)) {
+      L.style.display = 'none'; C.style.display = 'block';
+      const tilt = Math.asin(Math.min(1, inPlane)) / DEG;   // degrees off vertical
+      const k = 6;                                          // px per degree
+      let dx = ux / (inPlane || 1) * tilt * k, dy = -uy / (inPlane || 1) * tilt * k;
+      const a = -orient * DEG, rx = dx * Math.cos(a) - dy * Math.sin(a), ry = dx * Math.sin(a) + dy * Math.cos(a);
+      const ok = tilt < 1;
+      C.classList.toggle('ok', ok);
+      $('crossMove').style.transform = ok ? '' : `translate(${rx}px, ${ry}px)`;
+      return;
+    }
+    C.style.display = 'none';
+
+    // Horizon: only when the phone is held upright-ish (not near flat)
+    if (inPlane < 0.5) { L.style.display = 'none'; return; }
+    const phi = Math.atan2(uy, ux) / DEG - 90;           // horizon angle in device coords (ccw)
+    const target = Math.round(phi / 90) * 90;
+    let d = phi - target;
+    if (Math.abs(d) > 10) { L.style.display = 'none'; lv.okSince = 0; return; }
+    L.style.display = 'block';
+    const cssTarget = -(target + orient), cssCenter = -(phi + orient);
+    const ok = Math.abs(d) < 1;
+    L.classList.toggle('ok', ok);
+    $('lvTarget').style.transform = `rotate(${cssTarget}deg)`;
+    $('lvCenter').style.transform = `rotate(${ok ? cssTarget : cssCenter}deg)`;
+  }
+  async function enableLevel() {
+    try {
+      if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+        const r = await DeviceOrientationEvent.requestPermission();
+        if (r !== 'granted') { toast('水平器を使うには「動作と方向」の許可が必要です'); return; }
+      }
+      window.addEventListener('deviceorientation', onOrient);
+    } catch (_) {}
+  }
+  window.addEventListener('resize', placeLevel);
+  window.addEventListener('orientationchange', () => setTimeout(placeLevel, 300));
 
   // ---------- zoom (2×) ----------
   const swZoom = () => (state.hwZoom ? 1 : state.zoom);
@@ -766,10 +855,13 @@
       $('err').textContent = 'このページはHTTPSで開く必要があります（Safari推奨）。';
       return;
     }
+    const levelP = enableLevel(); // must be requested directly from the tap
     try {
       await openCamera();
       await listDevices();
       await loadPhotos();
+      await levelP;
+      placeLevel();
       $('start').style.display = 'none';
       try { if (!localStorage.getItem('sc_tip')) { $('tip').classList.add('open'); localStorage.setItem('sc_tip', '1'); } } catch (_) {}
     } catch (e) {
